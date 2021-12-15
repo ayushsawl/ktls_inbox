@@ -995,6 +995,11 @@ chcr_t7_ktls_get_tx_flits(u32 nr_frags, enum ch_ktls_record rec,
 		hdrlen += AES_BLOCK_LEN + sizeof(struct cpl_tx_tls_ack) +
 			  sizeof(struct cpl_fw6_pld) +
 			  TLS_CIPHER_AES_GCM_128_TAG_SIZE; /* for tag */
+	else if (rec == CH_KTLS_MIDDLE_RECORD)
+		hdrlen += sizeof(struct cpl_tx_tls_ack) +
+			  sizeof(struct cpl_fw6_pld) +
+			  TLS_CIPHER_AES_GCM_128_TAG_SIZE +
+			  sizeof(struct cpl_rx_phys_dsgl);
 
 	if (hdrlen + skb->len + key_ctx_len <= SGE_MAX_WR_LEN) {
 		*imm = true;
@@ -1384,6 +1389,65 @@ static void *fill_cpl_tx_pkt(struct sk_buff *skb, void *pos,
 	return pos;
 }
 
+void cxgb4_inline_tx_skb_t7(const struct sk_buff *skb,
+			    const struct sge_txq *q, void *pos, u32 skb_offset,
+			    u8 *prior_data, bool is_sgl)
+{
+        int left = (void *)q->stat - pos;
+
+	u64 *p;
+
+        if (likely(skb->len <= left)) {
+                if (likely(!skb->data_len)) {
+                        skb_copy_from_linear_data(skb, pos, skb_offset);
+			pos += skb_offset;
+			pos = chcr_copy_to_txd(prior_data, q, pos, 16);
+			if (is_sgl)
+				goto skip;
+			skb_copy_from_linear_data_offset(skb, skb_offset, pos,
+							 skb->len - skb_offset);
+		}
+                else {
+                        skb_copy_bits(skb, 0, pos, skb_offset);
+			pos += skb_offset;
+			pos = chcr_copy_to_txd(prior_data, q, pos, 16);
+			if (is_sgl)
+				goto skip;
+			skb_copy_bits(skb, skb_offset, pos,
+				      skb->len - skb_offset);
+		}
+                pos += skb->len - skb_offset;
+        } else {
+		if (left < skb_offset) {
+			skb_copy_bits(skb, 0, pos, left);
+			skb_copy_bits(skb, left, q->desc, skb_offset - left);
+			pos = (void *)q->desc + skb_offset;
+
+		} else if (left > skb_offset) {
+			skb_copy_bits(skb, 0, pos, skb_offset);
+			pos += skb_offset;
+			pos = (void *)q->desc + skb_offset;
+
+		} else if (left == skb_offset) {
+			skb_copy_bits(skb, 0, pos, left);
+			pos = (void *)q->desc + left;
+		}
+		pos = chcr_copy_to_txd(prior_data, q, pos, 16);
+		if (is_sgl)
+			goto skip;
+		skb_copy_bits(skb, skb_offset, pos,
+			      skb->len - skb_offset);
+                pos = (void *)q->desc + (skb->len - skb_offset);
+        }
+
+skip:
+        /* 0-pad to multiple of 16 */
+        p = PTR_ALIGN(pos, 8);
+        if ((uintptr_t)p & 8)
+                *p = 0;
+}
+
+
 /* chcr_t7_ktls_xmit_wr_complete: This sends out the complete record for T7 chip
  * @skb - segment which has complete or partial end part.
  * @tx_info - driver specific tls info.
@@ -1741,6 +1805,7 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
 {
 	u32 len16, wr_mid = 0, flits = 0, ndesc, cipher_start, tx_cpl_len;
 	struct adapter *adap = tx_info->adap;
+	struct cpl_rx_phys_dsgl *phys_cpl;
 	struct cpl_tx_tls_ack *ackcpl;
 	int credits, left, last_desc;
 	struct tx_sw_desc *sgl_sdesc;
@@ -1749,6 +1814,7 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
 	struct ulptx_idata *idata;
 	struct ulp_txpkt *ulptx;
 	struct fw_ulptx_wr *wr;
+	unsigned int hdrlen;
 	u64 *end, *sgl;
 	__be64 iv_record;
 	bool imm = false;
@@ -1758,6 +1824,8 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
         flits = chcr_t7_ktls_get_tx_flits(skb_shinfo(skb)->nr_frags,
 		  tls_rec_offset ? CH_KTLS_MIDDLE_RECORD : CH_KTLS_SHORT_RECORD,
 		  tx_info->key_ctx_len, skb, &imm);
+	if(prior_data_len)
+		flits += 2;
 	/* get the correct 8 byte IV of this record */
         iv_record = cpu_to_be64(tx_info->iv + tx_info->record_no);
 	/* number of descriptors */
@@ -1873,7 +1941,11 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
 	if (tls_rec_offset == 0) {
 		tx_info->key_ctx.ctx_hdr = htonl(KEY_CONTEXT_OPAD_PRESENT_V(1));
 		tx_info->key_ctx.phash_opad = 0;
+	} else {
+		tx_info->key_ctx.ctx_hdr = htonl(KEY_CONTEXT_OPAD_PRESENT_V(1));
+		tx_info->key_ctx.phash_opad = tx_info->phash;
 	}
+
         pos = chcr_copy_to_txd(&tx_info->key_ctx, &q->q, pos,
                                tx_info->key_ctx_len);
         left = (void *)q->q.stat - pos;
@@ -1922,6 +1994,36 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
 
         pos += 16;
 
+	/* cpl_rx_phys_dsgl */
+
+	/* We need to drop prior data in the wire
+	 * So we splitted the data as
+	 * headers(cpl_tx_pkt + eth + IP + TCP) | prior data | rest of the data
+	 * to drop prior data NUMSGE should be 1010
+	 * And split lenghs should be splitlen3 = hdrlen,
+	 * splitlen2 = prior data, splitlen1 = rest of the data len,
+	 * splitlen0 = 0 */
+	if (prior_data_len) {
+		phys_cpl = (void*)pos;
+		pos += sizeof(*phys_cpl);
+		phys_cpl->op_PhysAddrFields_hi = 0;
+		phys_cpl->PhysAddrFields_lo_to_NumSGE = htonl(CPL_RX_PHYS_DSGL_SPLITMODE_F |
+							      CPL_RX_PHYS_DSGL_NUMSGE_V(10));
+		hdrlen = sizeof(struct cpl_tx_pkt_core);
+
+		if (skb_shinfo(skb)->gso_size) {
+			if (skb->encapsulation)
+				hdrlen += sizeof(struct cpl_tx_tnl_lso);
+			else
+				hdrlen += sizeof(struct cpl_tx_pkt_lso_core);
+               }
+
+               hdrlen += skb_offset;
+
+               phys_cpl->RSSCopy[1] = htonl(prior_data_len | hdrlen << 16);
+               phys_cpl->RSSCopy[1] = htonl(0 | (skb->len - skb_offset) << 16);
+	}
+
 	/* cpl_tx_pkt_xt */
 	pos = fill_cpl_tx_pkt(skb, pos, adap, q, tx_info->netdev);
         sgl = (void *)pos;
@@ -1936,17 +2038,29 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
         }
 
         if (imm) {
-                cxgb4_inline_tx_skb(skb, &q->q, sgl);
+		if (prior_data_len)
+	                cxgb4_inline_tx_skb_t7(skb, &q->q, sgl, skb_offset,
+					       prior_data, 0);
+		else
+	                cxgb4_inline_tx_skb(skb, &q->q, sgl);
                 dev_consume_skb_any(skb);
         } else {
-                cxgb4_write_sgl(skb, &q->q, (void *)sgl, end, 0,
-                                sgl_sdesc->addr);
+		if (prior_data_len) {
+			cxgb4_inline_tx_skb_t7(skb, &q->q, sgl, skb_offset,
+					       prior_data, 1);
+			/* send the complete packet except the header */
+			cxgb4_write_partial_sgl(skb, &q->q, (void*)sgl, end, sgl_sdesc->addr,
+						skb_offset, data_len);
+		} else {
+			cxgb4_write_sgl(skb, &q->q, (void *)sgl, end, 0,
+					sgl_sdesc->addr);
+		}
                 skb_orphan(skb);
-                sgl_sdesc->skb = skb;
+		sgl_sdesc->skb = skb;
         }
 
-        chcr_txq_advance(&q->q, ndesc);
-        cxgb4_ring_tx_db(adap, &q->q, ndesc);
+	chcr_txq_advance(&q->q, ndesc);
+	cxgb4_ring_tx_db(adap, &q->q, ndesc);
 
 	wait_for_completion_timeout(&tx_info->completion, 30 * HZ);
 	atomic64_inc(&adap->ch_ktls_stats.ktls_tx_send_records);
