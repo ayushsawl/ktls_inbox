@@ -728,6 +728,26 @@ static int chcr_ktls_cpl_act_open_rpl(struct adapter *adap,
 	return 0;
 }
 
+static int cpl_fw6_pld_handler(struct adapter *adap, unsigned char *input)
+{
+	struct cpl_fw6_pld *fw6_pld;
+	struct chcr_ktls_info *tx_info = NULL;
+
+	fw6_pld = (struct cpl_fw6_pld *)input;
+	tx_info = (struct chcr_ktls_info *)(uintptr_t)be64_to_cpu(
+                                                    fw6_pld->data[1]);
+
+	if (tx_info == NULL)
+		return -EFAULT;
+
+	memcpy(&tx_info->phash, input + sizeof(struct cpl_fw6_pld),
+	       TLS_CIPHER_AES_GCM_128_TAG_SIZE);
+
+	complete(&tx_info->completion);
+
+	return 0;
+}
+
 /*
  * chcr_ktls_cpl_set_tcb_rpl: TCB reply received from TP.
  */
@@ -1928,6 +1948,9 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
         chcr_txq_advance(&q->q, ndesc);
         cxgb4_ring_tx_db(adap, &q->q, ndesc);
 
+	wait_for_completion_timeout(&tx_info->completion, 30 * HZ);
+	atomic64_inc(&adap->ch_ktls_stats.ktls_tx_send_records);
+
 	return 0;
 }
 
@@ -2894,6 +2917,7 @@ static const struct tlsdev_ops chcr_ktls_ops = {
 static chcr_handler_func work_handlers[NUM_CPL_CMDS] = {
 	[CPL_ACT_OPEN_RPL] = chcr_ktls_cpl_act_open_rpl,
 	[CPL_SET_TCB_RPL] = chcr_ktls_cpl_set_tcb_rpl,
+	[CPL_FW6_PLD] = cpl_fw6_pld_handler,
 };
 
 static int chcr_ktls_uld_rx_handler(void *handle, const __be64 *rsp,

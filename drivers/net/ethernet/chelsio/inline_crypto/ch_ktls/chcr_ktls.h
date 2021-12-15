@@ -64,7 +64,7 @@ struct chcr_ktls_info {
 	u32 tcp_start_seq_number;
 	u32 scmd0_short_seqno_numivs;
 	u32 scmd0_short_ivgen_hdrlen;
-	u16 prev_win;
+	u16 prev_win, phash;
 	u8 tx_chan;
 	u8 smt_idx;
 	u8 port_id;

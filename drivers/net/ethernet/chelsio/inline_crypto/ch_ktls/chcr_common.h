@@ -24,6 +24,7 @@ struct ktls_key_ctx {
 	__be64 iv_to_auth;
 	unsigned char key[TLS_CIPHER_AES_GCM_128_KEY_SIZE +
 			  TLS_CIPHER_AES_GCM_256_TAG_SIZE];
+	u16 phash_opad;
 };
 
 /* Crypto key context */
