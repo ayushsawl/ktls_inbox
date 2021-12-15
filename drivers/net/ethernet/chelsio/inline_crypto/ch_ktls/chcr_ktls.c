@@ -13,6 +13,13 @@
 
 static LIST_HEAD(uld_ctx_list);
 static DEFINE_MUTEX(dev_mutex);
+static int chcr_short_record_handler(struct chcr_ktls_info *tx_info,
+                                     struct sk_buff *skb,
+                                     struct tls_record_info *record,
+                                     u32 tcp_seq, int mss, bool tcp_push_no_fin,
+                                     u32 data_len, u32 skb_offset,
+                                     struct sge_eth_txq *q, u32 tls_end_offset,
+                                     unsigned int chip_ver);
 
 #define SIZE_ACK_ENC_CPL 32 /* cpl_fw6_pld */
 
@@ -1000,6 +1007,8 @@ chcr_t7_ktls_get_tx_flits(u32 nr_frags, enum ch_ktls_record rec,
 			  sizeof(struct cpl_fw6_pld) +
 			  TLS_CIPHER_AES_GCM_128_TAG_SIZE +
 			  sizeof(struct cpl_rx_phys_dsgl);
+	else if (rec == CH_KTLS_END_RECORD)
+		hdrlen += AES_BLOCK_LEN;
 
 	if (hdrlen + skb->len + key_ctx_len <= SGE_MAX_WR_LEN) {
 		*imm = true;
@@ -1799,6 +1808,7 @@ static int chcr_ktls_xmit_wr_complete(struct sk_buff *skb,
 static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
                                       struct chcr_ktls_info *tx_info,
                                       struct sge_eth_txq *q,
+				      struct tls_record_info *record,
                                       u32 tcp_seq, u32 tls_rec_offset,
 				      u8 *prior_data, u32 prior_data_len,
 				      u32 data_len, u32 skb_offset)
@@ -1806,6 +1816,7 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
 	u32 len16, wr_mid = 0, flits = 0, ndesc, cipher_start, tx_cpl_len;
 	struct adapter *adap = tx_info->adap;
 	struct cpl_rx_phys_dsgl *phys_cpl;
+	enum ch_ktls_record record_type;
 	struct cpl_tx_tls_ack *ackcpl;
 	int credits, left, last_desc;
 	struct tx_sw_desc *sgl_sdesc;
@@ -1815,17 +1826,38 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
 	struct ulp_txpkt *ulptx;
 	struct fw_ulptx_wr *wr;
 	unsigned int hdrlen;
+	u32 tls_end_offset;
+	u16 ciph_length;
 	u64 *end, *sgl;
 	__be64 iv_record;
 	bool imm = false;
 	void *pos;
 
+	if (tls_rec_offset) {
+		tls_end_offset = record->end_seq - tcp_seq;
+		if (tls_end_offset <= data_len)
+			record_type = CH_KTLS_END_RECORD;
+		else
+			record_type = CH_KTLS_MIDDLE_RECORD;
+	} else {
+		record_type = CH_KTLS_SHORT_RECORD;
+		tx_info->rec_start_seq = tcp_seq;
+       }
+
 	/* get the number of flits required */
         flits = chcr_t7_ktls_get_tx_flits(skb_shinfo(skb)->nr_frags,
-		  tls_rec_offset ? CH_KTLS_MIDDLE_RECORD : CH_KTLS_SHORT_RECORD,
-		  tx_info->key_ctx_len, skb, &imm);
-	if(prior_data_len)
-		flits += 2;
+		  record_type, tx_info->key_ctx_len, skb, &imm);
+
+	tls_end_offset = record->end_seq - tcp_seq;
+	/* For end record if any prior data needs to be sent we use
+	 * cpl_rx_phys_dsgl so adding space for 2 more flits
+	 */
+	if (prior_data_len) {
+		if (record_type == CH_KTLS_END_RECORD)
+			flits += 4;
+		else
+			flits += 2;
+	}
 	/* get the correct 8 byte IV of this record */
         iv_record = cpu_to_be64(tx_info->iv + tx_info->record_no);
 	/* number of descriptors */
@@ -1904,10 +1936,14 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
 	cipher_start = AES_BLOCK_LEN + skb_offset + TLS_HEADER_SIZE +
 		       tx_info->iv_size + 1;
 
-	cpl->aadstart_cipherstop_hi =
-		htonl(CPL_TX_SEC_PDU_AADSTART_V(AES_BLOCK_LEN + skb_offset + 1) |
-		      CPL_TX_SEC_PDU_AADSTOP_V(AES_BLOCK_LEN + skb_offset + TLS_HEADER_SIZE) |
-		      CPL_TX_SEC_PDU_CIPHERSTART_V(cipher_start));
+	if (tls_rec_offset == 0)
+		cpl->aadstart_cipherstop_hi =
+			htonl(CPL_TX_SEC_PDU_AADSTART_V(AES_BLOCK_LEN + skb_offset + 1) |
+			      CPL_TX_SEC_PDU_AADSTOP_V(AES_BLOCK_LEN + skb_offset + TLS_HEADER_SIZE) |
+			      CPL_TX_SEC_PDU_CIPHERSTART_V(cipher_start));
+	else
+		cpl->aadstart_cipherstop_hi =
+		             htonl(CPL_TX_SEC_PDU_CIPHERSTART_V(cipher_start));
 
 	/* authentication will also start after tls header + iv size */
         cpl->cipherstop_lo_authinsert =
@@ -1924,10 +1960,17 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
                             SCMD_IV_SIZE_V(TLS_CIPHER_AES_GCM_128_IV_SIZE >> 1) |
                             SCMD_NUM_IVS_V(1));
 
-        cpl->ivgen_hdrlen = htonl(SCMD_MORE_FRAGS_V(1) | SCMD_LAST_FRAG_V(0) |
-			    SCMD_KEY_CTX_INLINE_F);
-
-        cpl->scmd1 = cpu_to_be64(tx_info->record_no);
+        cpl->ivgen_hdrlen = htonl(SCMD_MORE_FRAGS_V(1) |
+				  SCMD_LAST_FRAG_V(record_type = CH_KTLS_END_RECORD ? 1 : 0) |
+				  SCMD_KEY_CTX_INLINE_F);
+	if (record_type == CH_KTLS_END_RECORD) {
+		ciph_length = record->end_seq - 16 - (tx_info->rec_start_seq + skb_offset + TLS_HEADER_SIZE + 8);
+	        cpl->scmd1 = ciph_length;
+		cpl->scmd1 = cpl->scmd1 << 44;
+		cpl->scmd1 = TLS_HEADER_SIZE;
+	} else {
+		cpl->scmd1 = cpu_to_be64(tx_info->record_no);
+	}
 
         pos = cpl + 1;
         /* check if space left to fill the keys */
@@ -1941,6 +1984,7 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
 	if (tls_rec_offset == 0) {
 		tx_info->key_ctx.ctx_hdr = htonl(KEY_CONTEXT_OPAD_PRESENT_V(1));
 		tx_info->key_ctx.phash_opad = 0;
+		tx_info->rec_start_seq = tcp_seq;
 	} else {
 		tx_info->key_ctx.ctx_hdr = htonl(KEY_CONTEXT_OPAD_PRESENT_V(1));
 		tx_info->key_ctx.phash_opad = tx_info->phash;
@@ -1958,6 +2002,8 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
 
 	/* Adding cpl_tx_tls_ack */
 
+	if (record_type == CH_KTLS_END_RECORD) /* No cpl_tx_tls_ack for last record */
+		 goto skip_tls_ack;
 	ackcpl = (void*)pos;
 	pos += sizeof(*ackcpl);
 	ackcpl->op_to_Rsvd2 = htonl(CPL_TX_TLS_ACK_OPCODE_V(CPL_TX_TLS_ACK) |
@@ -1974,6 +2020,7 @@ static int chcr_t7_ktls_xmit_wr_short(struct sk_buff *skb,
         *((__be64*)&enc_cpl->data[1]) = cpu_to_be64((uintptr_t)tx_info);
 	enc_cpl->len = TLS_CIPHER_AES_GCM_128_TAG_SIZE;
 
+skip_tls_ack:
 	/* check left again, it might go beyond queue limit */
         left = (void *)q->q.stat - pos;
 
@@ -2565,6 +2612,7 @@ static int chcr_end_part_handler(struct chcr_ktls_info *tx_info,
 				 unsigned int chip_ver)
 {
 	struct sk_buff *nskb = NULL;
+	int ret = 0;
 	/* check if it is a complete record */
 	if (tls_end_offset == record->len) {
 		nskb = skb;
@@ -2580,6 +2628,16 @@ static int chcr_end_part_handler(struct chcr_ktls_info *tx_info,
 		if (!nskb) {
 			dev_kfree_skb_any(skb);
 			return NETDEV_TX_BUSY;
+		}
+
+		if (chip_ver == CHELSIO_T7) {
+			ret = chcr_short_record_handler(tx_info, nskb,
+							record, tcp_seq, mss,
+							tcp_push_no_fin, nskb->len - skb_offset,
+							skb_offset, q, tls_end_offset,
+							chip_ver);
+			atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_end_pkts);
+			return ret;
 		}
 
 		/* copy complete record in skb */
@@ -2598,7 +2656,6 @@ static int chcr_end_part_handler(struct chcr_ktls_info *tx_info,
 
 		atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_end_pkts);
 	}
-
 	if (chcr_ktls_xmit_wr_complete(nskb, tx_info, q, tcp_seq,
 				       last_wr, record->len, skb_offset,
 				       record->num_frags,
@@ -2631,7 +2688,6 @@ out:
  * @mss - segment size in which TP needs to chop a packet.
  * @tcp_push_no_fin - tcp push if fin is not set.
  * @q - TX queue.
- * @tls_end_offset - offset from end of the record.
  * return: NETDEV_TX_OK/NETDEV_TX_BUSY.
  */
 static int chcr_short_record_handler(struct chcr_ktls_info *tx_info,
@@ -2752,7 +2808,7 @@ static int chcr_short_record_handler(struct chcr_ktls_info *tx_info,
 	}
 
 	if (chip_ver == CHELSIO_T7) {
-		if (chcr_t7_ktls_xmit_wr_short(skb, tx_info, q, tcp_seq,
+		if (chcr_t7_ktls_xmit_wr_short(skb, tx_info, q, record, tcp_seq,
 					       tls_rec_offset, prior_data,
 					       prior_data_len, data_len,
 					       skb_offset))
