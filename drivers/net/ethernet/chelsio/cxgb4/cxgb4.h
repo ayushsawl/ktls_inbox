@@ -57,6 +57,7 @@
 #include "t4_chip_type.h"
 #include "cxgb4_uld.h"
 #include "t4fw_api.h"
+#include "t4_msg.h"
 
 #define CH_WARN(adap, fmt, ...) dev_warn(adap->pdev_dev, fmt, ## __VA_ARGS__)
 extern struct list_head adapter_list;
@@ -1647,6 +1648,9 @@ int t4_sge_eth_txq_egress_update(struct adapter *adap, struct sge_eth_txq *q,
 void cxgb4_set_ethtool_ops(struct net_device *netdev);
 int cxgb4_write_rss(const struct port_info *pi, const u16 *queues);
 enum cpl_tx_tnl_lso_type cxgb_encap_offload_supported(struct sk_buff *skb);
+inline void t6_fill_tnl_lso(struct sk_buff *skb,
+                            struct cpl_tx_tnl_lso *tnl_lso,
+                            enum cpl_tx_tnl_lso_type tnl_type);
 extern int dbfifo_int_thresh;
 
 #define for_each_port(adapter, iter) \

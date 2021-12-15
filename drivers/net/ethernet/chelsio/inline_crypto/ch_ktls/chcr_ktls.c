@@ -68,7 +68,8 @@ static int chcr_init_tcb_fields(struct chcr_ktls_info *tx_info);
  */
 static int chcr_ktls_save_keys(struct chcr_ktls_info *tx_info,
 			       struct tls_crypto_info *crypto_info,
-			       enum tls_offload_ctx_dir direction)
+			       enum tls_offload_ctx_dir direction,
+			       unsigned int chip_ver)
 {
 	int ck_size, key_ctx_size, mac_key_size, keylen, ghash_size, ret;
 	unsigned char ghash_h[TLS_CIPHER_AES_GCM_256_TAG_SIZE];
@@ -93,33 +94,35 @@ static int chcr_ktls_save_keys(struct chcr_ktls_info *tx_info,
 		salt = info_128_gcm->salt;
 		tx_info->record_no = *(u64 *)info_128_gcm->rec_seq;
 
-		/* The SCMD fields used when encrypting a full TLS
-		 * record. Its a one time calculation till the
-		 * connection exists.
-		 */
-		tx_info->scmd0_seqno_numivs =
-			SCMD_SEQ_NO_CTRL_V(CHCR_SCMD_SEQ_NO_CTRL_64BIT) |
-			SCMD_CIPH_AUTH_SEQ_CTRL_F |
-			SCMD_PROTO_VERSION_V(CHCR_SCMD_PROTO_VERSION_TLS) |
-			SCMD_CIPH_MODE_V(CHCR_SCMD_CIPHER_MODE_AES_GCM) |
-			SCMD_AUTH_MODE_V(CHCR_SCMD_AUTH_MODE_GHASH) |
-			SCMD_IV_SIZE_V(TLS_CIPHER_AES_GCM_128_IV_SIZE >> 1) |
-			SCMD_NUM_IVS_V(1);
+		if (chip_ver != CHELSIO_T7) {
+			/* The SCMD fields used when encrypting a full TLS
+			 * record. Its a one time calculation till the
+			 * connection exists.
+			 */
+			tx_info->scmd0_seqno_numivs =
+				SCMD_SEQ_NO_CTRL_V(CHCR_SCMD_SEQ_NO_CTRL_64BIT) |
+				SCMD_CIPH_AUTH_SEQ_CTRL_F |
+				SCMD_PROTO_VERSION_V(CHCR_SCMD_PROTO_VERSION_TLS) |
+				SCMD_CIPH_MODE_V(CHCR_SCMD_CIPHER_MODE_AES_GCM) |
+				SCMD_AUTH_MODE_V(CHCR_SCMD_AUTH_MODE_GHASH) |
+				SCMD_IV_SIZE_V(TLS_CIPHER_AES_GCM_128_IV_SIZE >> 1) |
+				SCMD_NUM_IVS_V(1);
 
-		/* keys will be sent inline. */
-		tx_info->scmd0_ivgen_hdrlen = SCMD_KEY_CTX_INLINE_F;
+			/* keys will be sent inline. */
+			tx_info->scmd0_ivgen_hdrlen = SCMD_KEY_CTX_INLINE_F;
 
-		/* The SCMD fields used when encrypting a partial TLS
-		 * record (no trailer and possibly a truncated payload).
-		 */
-		tx_info->scmd0_short_seqno_numivs =
-			SCMD_CIPH_AUTH_SEQ_CTRL_F |
-			SCMD_PROTO_VERSION_V(CHCR_SCMD_PROTO_VERSION_GENERIC) |
-			SCMD_CIPH_MODE_V(CHCR_SCMD_CIPHER_MODE_AES_CTR) |
-			SCMD_IV_SIZE_V(AES_BLOCK_LEN >> 1);
+			/* The SCMD fields used when encrypting a partial TLS
+			 * record (no trailer and possibly a truncated payload).
+			 */
+			tx_info->scmd0_short_seqno_numivs =
+				SCMD_CIPH_AUTH_SEQ_CTRL_F |
+				SCMD_PROTO_VERSION_V(CHCR_SCMD_PROTO_VERSION_GENERIC) |
+				SCMD_CIPH_MODE_V(CHCR_SCMD_CIPHER_MODE_AES_CTR) |
+				SCMD_IV_SIZE_V(AES_BLOCK_LEN >> 1);
 
-		tx_info->scmd0_short_ivgen_hdrlen =
-			tx_info->scmd0_ivgen_hdrlen | SCMD_AADIVDROP_F;
+			tx_info->scmd0_short_ivgen_hdrlen =
+				tx_info->scmd0_ivgen_hdrlen | SCMD_AADIVDROP_F;
+		}
 
 		break;
 
@@ -313,6 +316,7 @@ static int chcr_setup_connection(struct sock *sk,
 			/* clear clip entry */
 			if (tx_info->ip_family == AF_INET6)
 				cxgb4_clip_release(tx_info->netdev,
+
 						   (const u32 *)
 						   &sk->sk_v6_rcv_saddr,
 						   1);
@@ -382,9 +386,19 @@ static void chcr_ktls_dev_del(struct net_device *netdev,
 				chcr_get_ktls_tx_context(tls_ctx);
 	struct chcr_ktls_info *tx_info = tx_ctx->chcr_info;
 	struct ch_ktls_port_stats_debug *port_stats;
+	unsigned int chip_ver;
+	struct adapter *adap;
+	struct port_info *pi;
+
+	pi = netdev_priv(netdev);
+	adap = pi->adapter;
+	chip_ver = CHELSIO_CHIP_VERSION(adap->params.chip);
 
 	if (!tx_info)
 		return;
+
+	if (chip_ver == CHELSIO_T7)
+		goto free_tx_info;
 
 	/* clear l2t entry */
 	if (tx_info->l2te)
@@ -406,6 +420,7 @@ static void chcr_ktls_dev_del(struct net_device *netdev,
 				 tx_info->tid, tx_info->ip_family);
 	}
 
+free_tx_info:
 	port_stats = &tx_info->adap->ch_ktls_stats.ktls_port[tx_info->port_id];
 	atomic64_inc(&port_stats->ktls_tx_connection_close);
 	kvfree(tx_info);
@@ -432,6 +447,7 @@ static int chcr_ktls_dev_add(struct net_device *netdev, struct sock *sk,
 	struct ch_ktls_port_stats_debug *port_stats;
 	struct chcr_ktls_ofld_ctx_tx *tx_ctx;
 	struct chcr_ktls_info *tx_info;
+	unsigned int chip_ver;
 	struct dst_entry *dst;
 	struct adapter *adap;
 	struct port_info *pi;
@@ -445,6 +461,7 @@ static int chcr_ktls_dev_add(struct net_device *netdev, struct sock *sk,
 	adap = pi->adapter;
 	port_stats = &adap->ch_ktls_stats.ktls_port[pi->port_id];
 	atomic64_inc(&port_stats->ktls_tx_connection_open);
+	chip_ver = CHELSIO_CHIP_VERSION(adap->params.chip);
 
 	if (direction == TLS_OFFLOAD_CTX_DIR_RX) {
 		pr_err("not expecting for RX direction\n");
@@ -481,9 +498,17 @@ static int chcr_ktls_dev_add(struct net_device *netdev, struct sock *sk,
 	tx_info->tcp_start_seq_number = start_offload_tcp_sn;
 
 	/* save crypto keys */
-	ret = chcr_ktls_save_keys(tx_info, crypto_info, direction);
+	ret = chcr_ktls_save_keys(tx_info, crypto_info, direction, chip_ver);
 	if (ret < 0)
 		goto free_tx_info;
+
+	if (chip_ver == CHELSIO_T7) {
+		if (!try_module_get(THIS_MODULE))
+			goto free_tx_info;
+		atomic64_inc(&port_stats->ktls_tx_ctx);
+		tx_ctx->chcr_info = tx_info;
+		return 0;
+	}
 
 	/* get peer ip */
 	if (sk->sk_family == AF_INET) {
@@ -922,6 +947,40 @@ static int chcr_ktls_xmit_tcb_cpls(struct chcr_ktls_info *tx_info,
 	return 0;
 }
 
+/* chcr_t7_ktls_get_tx_flits
+ * returns number of flits to be sent out for T7 chip, it includes key context
+ * length, WR size and skb fragments.
+ */
+static unsigned int
+chcr_t7_ktls_get_tx_flits(u32 nr_frags, enum ch_ktls_record rec,
+			  unsigned int key_ctx_len, struct sk_buff *skb,
+			  bool *imm)
+{
+	unsigned int hdrlen, flits;
+
+	hdrlen = sizeof(struct fw_ulptx_wr) + sizeof(struct ulp_txpkt) +
+		 sizeof(struct ulptx_idata) + sizeof(struct cpl_tx_sec_pdu) +
+		 sizeof(struct cpl_tx_pkt_core);
+
+	if (skb_shinfo(skb)->gso_size) {
+		if (skb->encapsulation)
+			hdrlen += sizeof(struct cpl_tx_tnl_lso);
+		else
+			hdrlen += sizeof(struct cpl_tx_pkt_lso_core);
+	}
+
+	if (hdrlen + skb->len + key_ctx_len <= SGE_MAX_WR_LEN) {
+		*imm = true;
+		return DIV_ROUND_UP(skb->len + hdrlen + key_ctx_len,
+				    sizeof(__be64));
+	}
+
+	flits = chcr_sgl_len(nr_frags);
+	flits += hdrlen / sizeof(__be64);
+
+	return flits;
+}
+
 /*
  * chcr_ktls_get_tx_flits
  * returns number of flits to be sent out, it includes key context length, WR
@@ -1075,6 +1134,406 @@ chcr_ktls_write_tcp_options(struct chcr_ktls_info *tx_info, struct sk_buff *skb,
 	chcr_txq_advance(&q->q, ndesc);
 	cxgb4_ring_tx_db(tx_info->adap, &q->q, ndesc);
 	return 0;
+}
+
+static inline void t7_ktls_fill_tnl_lso(struct sk_buff *skb,
+					struct cpl_tx_tnl_lso *tnl_lso,
+					enum cpl_tx_tnl_lso_type tnl_type)
+{
+	u32 val;
+	int in_eth_xtra_len;
+	int l3hdr_len = skb_network_header_len(skb);
+	int eth_xtra_len = skb_network_offset(skb) - ETH_HLEN;
+	const struct skb_shared_info *ssi = skb_shinfo(skb);
+	bool v6 = (ip_hdr(skb)->version == 6);
+
+	val = CPL_TX_TNL_LSO_OPCODE_V(CPL_TX_TNL_LSO) |
+	      CPL_TX_TNL_LSO_FIRST_F |
+	      CPL_TX_TNL_LSO_LAST_F |
+	      (v6 ? CPL_TX_TNL_LSO_IPV6OUT_F : 0) |
+	      CPL_TX_TNL_LSO_ETHHDRLENOUT_V(eth_xtra_len / 4) |
+	      CPL_TX_TNL_LSO_IPHDRLENOUT_V(l3hdr_len / 4) |
+	      (v6 ? 0 : CPL_TX_TNL_LSO_IPHDRCHKOUT_F) |
+	      CPL_TX_TNL_LSO_IPLENSETOUT_F |
+	      (v6 ? 0 : CPL_TX_TNL_LSO_IPIDINCOUT_F);
+
+	tnl_lso->op_to_IpIdSplitOut = htonl(val);
+
+	tnl_lso->IpIdOffsetOut = 0;
+
+	/* Get the tunnel header length */
+	val = skb_inner_mac_header(skb) - skb_mac_header(skb);
+	in_eth_xtra_len = skb_inner_network_header(skb) -
+			  skb_inner_mac_header(skb) - ETH_HLEN;
+
+	switch (tnl_type) {
+	case TX_TNL_TYPE_VXLAN:
+	case TX_TNL_TYPE_GENEVE:
+		tnl_lso->UdpLenSetOut_to_TnlHdrLen =
+			htons(CPL_TX_TNL_LSO_UDPCHKCLROUT_F |
+			CPL_TX_TNL_LSO_UDPLENSETOUT_F);
+		break;
+	default:
+		tnl_lso->UdpLenSetOut_to_TnlHdrLen = 0;
+		break;
+	}
+
+	tnl_lso->UdpLenSetOut_to_TnlHdrLen |=
+			htons(CPL_TX_TNL_LSO_TNLHDRLEN_V(val) |
+			CPL_TX_TNL_LSO_TNLTYPE_V(tnl_type));
+
+	tnl_lso->r1 = 0;
+
+	val = CPL_TX_TNL_LSO_ETHHDRLEN_V(in_eth_xtra_len / 4) |
+	      CPL_TX_TNL_LSO_IPV6_V(inner_ip_hdr(skb)->version == 6) |
+	      CPL_TX_TNL_LSO_IPHDRLEN_V(skb_inner_network_header_len(skb) / 4) |
+	      CPL_TX_TNL_LSO_TCPHDRLEN_V(inner_tcp_hdrlen(skb) / 4);
+	tnl_lso->Flow_to_TcpHdrLen = htonl(val);
+
+	tnl_lso->IpIdOffset = htons(0);
+
+	tnl_lso->IpIdSplit_to_Mss = htons(CPL_TX_TNL_LSO_MSS_V(ssi->gso_size));
+	tnl_lso->TCPSeqOffset = htonl(0);
+	tnl_lso->EthLenOffset_Size = htonl(CPL_TX_TNL_LSO_SIZE_V(skb->len));
+}
+
+static inline void *t7_write_tso_wr(struct adapter *adap, struct sk_buff *skb,
+				    struct cpl_tx_pkt_lso_core *lso)
+{
+	int eth_xtra_len = skb_network_offset(skb) - ETH_HLEN;
+	int l3hdr_len = skb_network_header_len(skb);
+	const struct skb_shared_info *ssi;
+	bool ipv6 = false;
+
+	ssi = skb_shinfo(skb);
+	if (ssi->gso_type & SKB_GSO_TCPV6)
+		ipv6 = true;
+
+	lso->lso_ctrl = htonl(LSO_OPCODE_V(CPL_TX_PKT_LSO) |
+			      LSO_FIRST_SLICE_F | LSO_LAST_SLICE_F |
+			      LSO_IPV6_V(ipv6) |
+			      LSO_ETHHDR_LEN_V(eth_xtra_len / 4) |
+			      LSO_IPHDR_LEN_V(l3hdr_len / 4) |
+			      LSO_TCPHDR_LEN_V(tcp_hdr(skb)->doff));
+	lso->ipid_ofst = htons(0);
+	lso->mss = htons(ssi->gso_size);
+	lso->seqno_offset = htonl(0);
+	if (is_t4(adap->params.chip))
+		lso->len = htonl(skb->len);
+	else
+		lso->len = htonl(LSO_T5_XFER_SIZE_V(skb->len));
+
+	return (void *)(lso + 1);
+}
+
+/* Figure out what HW csum a packet wants and return the appropriate control
+ * bits.
+ */
+static u64 t7_hwcsum(enum chip_type chip, const struct sk_buff *skb)
+{
+	int csum_type;
+	bool inner_hdr_csum = false;
+	u16 proto, ver;
+
+	if (skb->encapsulation && (CHELSIO_CHIP_VERSION(chip) > CHELSIO_T7))
+		inner_hdr_csum = true;
+
+	if (inner_hdr_csum) {
+		ver = inner_ip_hdr(skb)->version;
+		proto = (ver == 4) ? inner_ip_hdr(skb)->protocol :
+			inner_ipv6_hdr(skb)->nexthdr;
+	} else {
+		ver = ip_hdr(skb)->version;
+		proto = (ver == 4) ? ip_hdr(skb)->protocol :
+			ipv6_hdr(skb)->nexthdr;
+	}
+
+	if (ver == 4) {
+		if (proto == IPPROTO_TCP) {
+			csum_type = TX_CSUM_TCPIP;
+		} else if (proto == IPPROTO_UDP) {
+			csum_type = TX_CSUM_UDPIP;
+		} else {
+nocsum:                 /*
+			 * unknown protocol, disable HW csum
+			 * and hope a bad packet is detected
+			 */
+			return TXPKT_L4CSUM_DIS_F;
+		}
+	} else {
+		/* this doesn't work with extension headers */
+		if (proto == IPPROTO_TCP)
+			csum_type = TX_CSUM_TCPIP6;
+		else if (proto == IPPROTO_UDP)
+			csum_type = TX_CSUM_UDPIP6;
+		else
+			goto nocsum;
+	}
+
+	if (likely(csum_type >= TX_CSUM_TCPIP)) {
+		int eth_hdr_len, l4_len;
+		u64 hdr_len;
+
+		if (inner_hdr_csum) {
+			/* This allows checksum offload for all encapsulated
+			 * packets like GRE etc..
+			 */
+			l4_len = skb_inner_network_header_len(skb);
+			eth_hdr_len = skb_inner_network_offset(skb) - ETH_HLEN;
+		} else {
+			l4_len = skb_network_header_len(skb);
+			eth_hdr_len = skb_network_offset(skb) - ETH_HLEN;
+		}
+		hdr_len = TXPKT_IPHDR_LEN_V(l4_len);
+
+		if (CHELSIO_CHIP_VERSION(chip) <= CHELSIO_T7)
+			hdr_len |= TXPKT_ETHHDR_LEN_V(eth_hdr_len);
+		else
+			hdr_len |= T6_TXPKT_ETHHDR_LEN_V(eth_hdr_len);
+		return TXPKT_CSUM_TYPE_V(csum_type) | hdr_len;
+	} else {
+		int start = skb_transport_offset(skb);
+
+		return TXPKT_CSUM_TYPE_V(csum_type) |
+			TXPKT_CSUM_START_V(start) |
+			TXPKT_CSUM_LOC_V(start + skb->csum_offset);
+	}
+}
+
+static void *fill_cpl_tx_pkt(struct sk_buff *skb, void *pos,
+			     struct adapter *adap, struct sge_eth_txq *q,
+			     struct net_device *dev)
+{
+	enum cpl_tx_tnl_lso_type tnl_type;
+	struct cpl_tx_pkt_core *cpltxp;
+	const struct port_info *pi;
+	u64 cntrl;
+	u32 ctrl0;
+
+	pi = netdev_priv(dev);
+	if (skb_shinfo(skb)->gso_size) {
+		struct cpl_tx_pkt_lso_core *lso = (void *)(pos);
+		struct cpl_tx_tnl_lso *tnl_lso = (void *)(pos);
+		if (tnl_type) {
+			struct iphdr *iph = ip_hdr(skb);
+
+                        t6_fill_tnl_lso(skb, tnl_lso, tnl_type);
+                        cpltxp = (void *)(tnl_lso + 1);
+                        /* Driver is expected to compute partial checksum that
+                         * does not include the IP Total Length.
+                         */
+                        if (iph->version == 4) {
+                                iph->check = 0;
+                                iph->tot_len = 0;
+                                iph->check = ~ip_fast_csum((u8 *)iph, iph->ihl);
+                        }
+                        if (skb->ip_summed == CHECKSUM_PARTIAL)
+                                cntrl = t7_hwcsum(adap->params.chip, skb);
+                } else {
+                        cpltxp = t7_write_tso_wr(adap, skb, lso);
+                        cntrl = t7_hwcsum(adap->params.chip, skb);
+                }
+		pos = (u64 *)(cpltxp + 1); /* sgl start here */
+                q->tso++;
+                q->tx_cso += skb_shinfo(skb)->gso_segs;
+        } else {
+                cpltxp = (void *)(pos);
+                pos = (u64 *)(cpltxp + 1);
+                if (skb->ip_summed == CHECKSUM_PARTIAL) {
+                        cntrl = t7_hwcsum(adap->params.chip, skb) |
+                                TXPKT_IPCSUM_DIS_F;
+                        q->tx_cso++;
+                }
+        }
+
+	ctrl0 = TXPKT_OPCODE_V(CPL_TX_PKT_XT) | TXPKT_INTF_V(pi->tx_chan) |
+                TXPKT_PF_V(adap->pf);
+
+        cpltxp->ctrl0 = htonl(ctrl0);
+        cpltxp->pack = htons(0);
+        cpltxp->len = htons(skb->len);
+        cpltxp->ctrl1 = cpu_to_be64(cntrl);
+
+	return pos;
+}
+
+/* chcr_t7_ktls_xmit_wr_complete: This sends out the complete record for T7 chip
+ * @skb - segment which has complete or partial end part.
+ * @tx_info - driver specific tls info.
+ * @q - TX queue.
+ * @tcp_seq - sequence number of first Tls byte received in this skb
+ * @data_len - Tls packet data length received in this skb
+ * @skb_offset - offset from start of the packet upto tls header
+ * @nfrags - number of skb fragments
+ * return: NETDEV_TX_BUSY/NET_TX_OK.
+ */
+static int chcr_t7_ktls_xmit_wr_complete(struct sk_buff *skb,
+					 struct chcr_ktls_info *tx_info,
+					 struct sge_eth_txq *q, u32 tcp_seq,
+					 u32 data_len, u32 skb_offset, u32 nfrags)
+{
+	u32 len16, wr_mid = 0, flits = 0, ndesc, cipher_start, tx_cpl_len;
+	struct adapter *adap = tx_info->adap;
+	int credits, left, last_desc;
+	struct tx_sw_desc *sgl_sdesc;
+	struct cpl_tx_sec_pdu *cpl;
+	struct ulptx_idata *idata;
+	struct ulp_txpkt *ulptx;
+	struct fw_ulptx_wr *wr;
+	u64 *end, *sgl;
+	bool imm = false;
+	void *pos;
+
+	/* get the number of flits required */
+	flits = chcr_t7_ktls_get_tx_flits(nfrags, CH_KTLS_FULL_RECORD,
+					  tx_info->key_ctx_len, skb, &imm);
+	/* number of descriptors */
+	ndesc = chcr_flits_to_desc(flits);
+	/* check if enough credits available */
+	credits = chcr_txq_avail(&q->q) - ndesc;
+	if (unlikely(credits < 0)) {
+		chcr_eth_txq_stop(q);
+		return NETDEV_TX_BUSY;
+	}
+
+	if (unlikely(credits < ETHTXQ_STOP_THRES)) {
+		/* Credits are below the threshold vaues, stop the queue after
+		 * injecting the Work Request for this packet.
+		 */
+		chcr_eth_txq_stop(q);
+		wr_mid |= FW_WR_EQUEQ_F | FW_WR_EQUIQ_F;
+	}
+
+	last_desc = q->q.pidx + ndesc - 1;
+	if (last_desc >= q->q.size)
+		last_desc -= q->q.size;
+	sgl_sdesc = &q->q.sdesc[last_desc];
+
+	if (unlikely(cxgb4_map_skb(adap->pdev_dev, skb, sgl_sdesc->addr) < 0)) {
+		memset(sgl_sdesc->addr, 0, sizeof(sgl_sdesc->addr));
+		q->mapping_err++;
+		return NETDEV_TX_BUSY;
+	}
+
+	pos = &q->q.desc[q->q.pidx];
+	end = (u64 *)pos + flits;
+	/* FW_ULPTX_WR */
+	wr = pos;
+	/* WR will need len16 */
+	len16 = DIV_ROUND_UP(flits, 2);
+	wr->op_to_compl = htonl(FW_WR_OP_V(FW_ULPTX_WR));
+	wr->flowid_len16 = htonl(wr_mid | FW_WR_LEN16_V(len16));
+	wr->cookie = 0;
+	pos += sizeof(*wr);
+	/* ULP_TXPKT */
+	ulptx = pos;
+	ulptx->cmd_dest = htonl(ULPTX_CMD_V(ULP_TX_PKT) |
+				ULP_TXPKT_CHANNELID_V(tx_info->port_id) |
+				ULP_TXPKT_FID_V(q->q.cntxt_id) |
+				ULP_TXPKT_RO_F);
+	ulptx->len = htonl(len16 - 1);
+	/* ULPTX_IDATA sub-command */
+	idata = (struct ulptx_idata *)(ulptx + 1);
+	idata->cmd_more = htonl(ULPTX_CMD_V(ULP_TX_SC_IMM) | ULP_TX_SC_MORE_F);
+	/* idata length will include cpl_tx_sec_pdu + key context size +
+	 * cpl_tx_pkt_xt + imm data len.
+	 */
+	tx_cpl_len = sizeof(struct cpl_tx_pkt_core);
+	if (skb_shinfo(skb)->gso_size) {
+		if (skb->encapsulation)
+			tx_cpl_len += sizeof(struct cpl_tx_tnl_lso);
+		else
+			tx_cpl_len += sizeof(struct cpl_tx_pkt_lso_core);
+	}
+
+	idata->len = htonl(sizeof(*cpl) + tx_info->key_ctx_len +
+			   tx_cpl_len + imm ? skb->len : 0);
+
+	/* SEC CPL */
+	cpl = (struct cpl_tx_sec_pdu *)(idata + 1);
+	cpl->op_ivinsrtofst =
+		htonl(CPL_TX_SEC_PDU_OPCODE_V(CPL_TX_SEC_PDU) |
+		      CPL_TX_SEC_PDU_CPLLEN_V(CHCR_CPL_TX_SEC_PDU_LEN_64BIT) |
+		      CPL_TX_SEC_PDU_PLACEHOLDER_V(1) |
+		      CPL_TX_SEC_PDU_IVINSRTOFST_V(skb_offset + TLS_HEADER_SIZE + 1));
+	cpl->pldlen = htonl(skb->len);
+
+	/* encryption should start after tls header size + iv size */
+	cipher_start = skb_offset + TLS_HEADER_SIZE + tx_info->iv_size + 1;
+
+	cpl->aadstart_cipherstop_hi =
+		htonl(CPL_TX_SEC_PDU_AADSTART_V(skb_offset + 1) |
+		      CPL_TX_SEC_PDU_AADSTOP_V(skb_offset + TLS_HEADER_SIZE) |
+		      CPL_TX_SEC_PDU_CIPHERSTART_V(cipher_start));
+
+	/* authentication will also start after tls header + iv size */
+	cpl->cipherstop_lo_authinsert =
+	htonl(CPL_TX_SEC_PDU_AUTHSTART_V(cipher_start) |
+	      CPL_TX_SEC_PDU_AUTHSTOP_V(TLS_CIPHER_AES_GCM_128_TAG_SIZE) |
+	      CPL_TX_SEC_PDU_AUTHINSERT_V(TLS_CIPHER_AES_GCM_128_TAG_SIZE));
+
+	/* These two flits are actually a CPL_TLS_TX_SCMD_FMT. */
+	cpl->seqno_numivs = htonl(SCMD_SEQ_NO_CTRL_V(CHCR_SCMD_SEQ_NO_CTRL_64BIT) |
+			    SCMD_CIPH_AUTH_SEQ_CTRL_F |
+			    SCMD_PROTO_VERSION_V(CHCR_SCMD_PROTO_VERSION_TLS) |
+			    SCMD_CIPH_MODE_V(CHCR_SCMD_CIPHER_MODE_AES_GCM) |
+			    SCMD_AUTH_MODE_V(CHCR_SCMD_AUTH_MODE_GHASH) |
+			    SCMD_IV_SIZE_V(TLS_CIPHER_AES_GCM_128_IV_SIZE >> 1) |
+			    SCMD_NUM_IVS_V(1));
+
+	cpl->ivgen_hdrlen = htonl(SCMD_KEY_CTX_INLINE_F);
+
+	cpl->scmd1 = cpu_to_be64(tx_info->record_no);
+
+	pos = cpl + 1;
+	/* check if space left to fill the keys */
+	left = (void *)q->q.stat - pos;
+	if (!left) {
+		left = (void *)end - (void *)q->q.stat;
+		pos = q->q.desc;
+		end = pos + left;
+	}
+
+	pos = chcr_copy_to_txd(&tx_info->key_ctx, &q->q, pos,
+			       tx_info->key_ctx_len);
+	left = (void *)q->q.stat - pos;
+
+	if (!left) {
+		left = (void *)end - (void *)q->q.stat;
+		pos = q->q.desc;
+		end = pos + left;
+	}
+
+	/* cpl_tx_pkt_xt */
+
+	pos = fill_cpl_tx_pkt(skb, pos, adap, q, tx_info->netdev);
+
+	sgl = (void *)pos;
+	if (unlikely((u8 *)sgl >= (u8 *)q->q.stat)) {
+		/* If current position is already at the end of the
+		 * txq, reset the current to point to start of the queue
+		 * and update the end ptr as well.
+		 */
+		left = (u8 *)end - (u8 *)q->q.stat;
+		end = (void *)q->q.desc + left;
+		sgl = (void *)q->q.desc;
+	}
+
+	if (imm) {
+		cxgb4_inline_tx_skb(skb, &q->q, sgl);
+		dev_consume_skb_any(skb);
+	} else {
+		cxgb4_write_sgl(skb, &q->q, (void *)sgl, end, 0,
+				sgl_sdesc->addr);
+		skb_orphan(skb);
+		sgl_sdesc->skb = skb;
+	}
+
+	chcr_txq_advance(&q->q, ndesc);
+	cxgb4_ring_tx_db(adap, &q->q, ndesc);
+	atomic64_inc(&adap->ch_ktls_stats.ktls_tx_send_records);
+
+	return NETDEV_TX_OK;
 }
 
 /*
@@ -1731,6 +2190,7 @@ static int chcr_ktls_update_snd_una(struct chcr_ktls_info *tx_info,
  * @q - TX queue.
  * @tls_end_offset - offset from end of the record.
  * @last wr : check if this is the last part of the skb going out.
+ * @chip_ver : version of the chip.
  * return: NETDEV_TX_OK/NETDEV_TX_BUSY.
  */
 static int chcr_end_part_handler(struct chcr_ktls_info *tx_info,
@@ -1738,13 +2198,20 @@ static int chcr_end_part_handler(struct chcr_ktls_info *tx_info,
 				 struct tls_record_info *record,
 				 u32 tcp_seq, int mss, bool tcp_push_no_fin,
 				 struct sge_eth_txq *q, u32 skb_offset,
-				 u32 tls_end_offset, bool last_wr)
+				 u32 tls_end_offset, bool last_wr,
+				 unsigned int chip_ver)
 {
 	struct sk_buff *nskb = NULL;
 	/* check if it is a complete record */
 	if (tls_end_offset == record->len) {
 		nskb = skb;
-		atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_complete_pkts);
+		if (chip_ver == CHELSIO_T7) {
+			chcr_t7_ktls_xmit_wr_complete(nskb, tx_info, q, tcp_seq,
+						      record->len, skb_offset,
+						      record->num_frags);
+			atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_complete_pkts);
+			return 0;
+		}
 	} else {
 		nskb = alloc_skb(0, GFP_ATOMIC);
 		if (!nskb) {
@@ -1974,6 +2441,7 @@ static int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct chcr_ktls_info *tx_info;
 	struct tls_context *tls_ctx;
 	struct sge_eth_txq *q;
+	unsigned int chip_ver;
 	struct adapter *adap;
 	unsigned long flags;
 
@@ -1998,11 +2466,12 @@ static int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
 	stats = &adap->ch_ktls_stats;
 	port_stats = &stats->ktls_port[tx_info->port_id];
 
+	chip_ver = CHELSIO_CHIP_VERSION(adap->params.chip);
 	qidx = skb->queue_mapping;
 	q = &adap->sge.ethtxq[qidx + tx_info->first_qset];
 	cxgb4_reclaim_completed_tx(adap, &q->q, true);
 	/* if tcp options are set but finish is not send the options first */
-	if (!th->fin && chcr_ktls_check_tcp_options(th)) {
+	if (chip_ver != CHELSIO_T7 && !th->fin && chcr_ktls_check_tcp_options(th)) {
 		ret = chcr_ktls_write_tcp_options(tx_info, skb, q,
 						  tx_info->tx_chan);
 		if (ret)
@@ -2038,7 +2507,7 @@ static int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
 		pr_debug("seq 0x%x, end_seq 0x%x prev_seq 0x%x, datalen 0x%x\n",
 			 tcp_seq, record->end_seq, tx_info->prev_seq, data_len);
 		/* update tcb for the skb */
-		if (skb_data_len == data_len) {
+		if (chip_ver != CHELSIO_T7 && skb_data_len == data_len) {
 			u32 tx_max = tcp_seq;
 
 			if (!tls_record_is_start_marker(record) &&
@@ -2111,7 +2580,8 @@ static int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
 						    skb_offset,
 						    tls_end_offset,
 						    skb_offset +
-						    tls_end_offset == skb->len);
+						    tls_end_offset == skb->len,
+						    chip_ver);
 
 			data_len -= tls_end_offset;
 			/* tcp_seq increment is required to handle next record.

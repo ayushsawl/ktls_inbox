@@ -1313,10 +1313,11 @@ enum cpl_tx_tnl_lso_type cxgb_encap_offload_supported(struct sk_buff *skb)
 
 	return tnl_type;
 }
+EXPORT_SYMBOL(cxgb_encap_offload_supported);
 
-static inline void t6_fill_tnl_lso(struct sk_buff *skb,
-				   struct cpl_tx_tnl_lso *tnl_lso,
-				   enum cpl_tx_tnl_lso_type tnl_type)
+inline void t6_fill_tnl_lso(struct sk_buff *skb,
+			    struct cpl_tx_tnl_lso *tnl_lso,
+			    enum cpl_tx_tnl_lso_type tnl_type)
 {
 	u32 val;
 	int in_eth_xtra_len;
@@ -1373,6 +1374,7 @@ static inline void t6_fill_tnl_lso(struct sk_buff *skb,
 	tnl_lso->TCPSeqOffset = htonl(0);
 	tnl_lso->EthLenOffset_Size = htonl(CPL_TX_TNL_LSO_SIZE_V(skb->len));
 }
+EXPORT_SYMBOL(t6_fill_tnl_lso);
 
 static inline void *write_tso_wr(struct adapter *adap, struct sk_buff *skb,
 				 struct cpl_tx_pkt_lso_core *lso)

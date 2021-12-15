@@ -34,6 +34,13 @@ enum ch_ktls_open_state {
 	CH_KTLS_OPEN_FAILURE = 2,
 };
 
+enum ch_ktls_record {
+	CH_KTLS_FULL_RECORD = 0,
+	CH_KTLS_END_RECORD = 1,
+	CH_KTLS_SHORT_RECORD = 2,
+	CH_KTLS_MIDDLE_RECORD = 3,
+};
+
 struct chcr_ktls_info {
 	struct sock *sk;
 	spinlock_t lock; /* lock for pending_close */
@@ -65,6 +72,7 @@ struct chcr_ktls_info {
 	u8 first_qset;
 	enum ch_ktls_open_state open_state;
 	bool pending_close;
+	u32 expected_seq;
 };
 
 struct chcr_ktls_ofld_ctx_tx {

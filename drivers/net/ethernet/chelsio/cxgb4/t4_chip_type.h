@@ -39,6 +39,7 @@
 #define CHELSIO_T4		0x4
 #define CHELSIO_T5		0x5
 #define CHELSIO_T6		0x6
+#define CHELSIO_T7              0x7
 
 /* We code the Chelsio T4 Family "Chip Code" as a tuple:
  *
