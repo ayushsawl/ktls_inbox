@@ -2349,4 +2349,80 @@ struct cpl_rx_tls_cmp {
 #define CPL_RX_TLS_CMP_LENGTH_V(x)      ((x) << CPL_RX_TLS_CMP_LENGTH_S)
 #define CPL_RX_TLS_CMP_LENGTH_G(x)      \
 	(((x) >> CPL_RX_TLS_CMP_LENGTH_S) & CPL_RX_TLS_CMP_LENGTH_M)
+
+/* CPL_TX_TLS_ACK */
+struct cpl_tx_tls_ack {
+	__be32 op_to_Rsvd2;
+	__be32 PldLen;
+	__be64 Rsvd3;
+};
+
+
+#define CPL_TX_TLS_ACK_OPCODE_S         24
+#define CPL_TX_TLS_ACK_OPCODE_M         0xff
+#define CPL_TX_TLS_ACK_OPCODE_V(x)      ((x) << CPL_TX_TLS_ACK_OPCODE_S)
+#define CPL_TX_TLS_ACK_OPCODE_G(x)      \
+	(((x) >> CPL_TX_TLS_ACK_OPCODE_S) & CPL_TX_TLS_ACK_OPCODE_M)
+
+#define CPL_TX_TLS_ACK_RSVD1_S          23
+#define CPL_TX_TLS_ACK_RSVD1_M          0x1
+#define CPL_TX_TLS_ACK_RSVD1_V(x)       ((x) << S_CPL_TX_TLS_ACK_RSVD1)
+#define CPL_TX_TLS_ACK_RSVD1_G(x)       \
+	(((x) >> CPL_TX_TLS_ACK_RSVD1_S) & CPL_TX_TLS_ACK_RSVD1_M)
+#define F_CPL_TX_TLS_ACK_RSVD1  V_CPL_TX_TLS_ACK_RSVD1(1U)
+
+#define CPL_TX_TLS_ACK_RXCHID_S         22
+#define CPL_TX_TLS_ACK_RXCHID_M         0x1
+#define CPL_TX_TLS_ACK_RXCHID_V(x)      ((x) << CPL_TX_TLS_ACK_RXCHID_S)
+#define CPL_TX_TLS_ACK_RXCHID_G(x)      \
+	(((x) >> CPL_TX_TLS_ACK_RXCHID_S) & CPL_TX_TLS_ACK_RXCHID_M)
+#define CPL_TX_TLS_ACK_RXCHID_F CPL_TX_TLS_ACK_RXCHID_V(1U)
+
+#define CPL_TX_TLS_ACK_FWMSG_S          21
+#define CPL_TX_TLS_ACK_FWMSG_M          0x1
+#define CPL_TX_TLS_ACK_FWMSG_V(x)       ((x) << CPL_TX_TLS_ACK_FWMSG_S)
+#define CPL_TX_TLS_ACK_FWMSG_G(x)       \
+	(((x) >> CPL_TX_TLS_ACK_FWMSG_S) & CPL_TX_TLS_ACK_FWMSG_M)
+#define CPL_TX_TLS_ACK_FWMSG_F  CPL_TX_TLS_ACK_FWMSG_V(1U)
+
+#define CPL_TX_TLS_ACK_ULPTXLPBK_S      20
+#define CPL_TX_TLS_ACK_ULPTXLPBK_M      0x1
+#define CPL_TX_TLS_ACK_ULPTXLPBK_V(x)   ((x) << CPL_TX_TLS_ACK_ULPTXLPBK_S)
+#define CPL_TX_TLS_ACK_ULPTXLPBK_G(x)   \
+    (((x) >> CPL_TX_TLS_ACK_ULPTXLPBK_S) & CPL_TX_TLS_ACK_ULPTXLPBK_M)
+#define CPL_TX_TLS_ACK_ULPTXLPBK_F      CPL_TX_TLS_ACK_ULPTXLPBK_V(1U)
+
+#define CPL_TX_TLS_ACK_CPLLEN_S         16
+#define CPL_TX_TLS_ACK_CPLLEN_M         0xf
+#define CPL_TX_TLS_ACK_CPLLEN_V(x)      ((x) << CPL_TX_TLS_ACK_CPLLEN_S)
+#define CPL_TX_TLS_ACK_CPLLEN_G(x)      \
+    (((x) >> CPL_TX_TLS_ACK_CPLLEN_S) & CPL_TX_TLS_ACK_CPLLEN_M)
+
+#define CPL_TX_TLS_ACK_COMPLONERR_S     15
+#define CPL_TX_TLS_ACK_COMPLONERR_M     0x1
+#define CPL_TX_TLS_ACK_COMPLONERR_V(x)  ((x) << CPL_TX_TLS_ACK_COMPLONERR_S)
+#define CPL_TX_TLS_ACK_COMPLONERR_G(x)  \
+    (((x) >> CPL_TX_TLS_ACK_COMPLONERR_S) & CPL_TX_TLS_ACK_COMPLONERR_M)
+#define CPL_TX_TLS_ACK_COMPLONERR_F     CPL_TX_TLS_ACK_COMPLONERR_V(1U)
+
+#define CPL_TX_TLS_ACK_LCB_S    14
+#define CPL_TX_TLS_ACK_LCB_M    0x1
+#define CPL_TX_TLS_ACK_LCB_V(x) ((x) << CPL_TX_TLS_ACK_LCB_S)
+#define CPL_TX_TLS_ACK_LCB_G(x) \
+    (((x) >> CPL_TX_TLS_ACK_LCB_S) & CPL_TX_TLS_ACK_LCB_M)
+#define CPL_TX_TLS_ACK_LCB_F    CPL_TX_TLS_ACK_LCB_V(1U)
+
+#define CPL_TX_TLS_ACK_PHASH_S          13
+#define CPL_TX_TLS_ACK_PHASH_M          0x1
+#define CPL_TX_TLS_ACK_PHASH_V(x)       ((x) << CPL_TX_TLS_ACK_PHASH_S)
+#define CPL_TX_TLS_ACK_PHASH_G(x)       \
+    (((x) >> CPL_TX_TLS_ACK_PHASH_S) & CPL_TX_TLS_ACK_PHASH_M)
+#define CPL_TX_TLS_ACK_PHASH_F  CPL_TX_TLS_ACK_PHASH_V(1U)
+
+#define CPL_TX_TLS_ACK_RSVD2_S          0
+#define CPL_TX_TLS_ACK_RSVD2_M          0x1fff
+#define CPL_TX_TLS_ACK_RSVD2_V(x)       ((x) << CPL_TX_TLS_ACK_RSVD2_S)
+#define CPL_TX_TLS_ACK_RSVD2_G(x)       \
+    (((x) >> CPL_TX_TLS_ACK_RSVD2_S) & CPL_TX_TLS_ACK_RSVD2_M)
+
 #endif  /* __T4_MSG_H */
