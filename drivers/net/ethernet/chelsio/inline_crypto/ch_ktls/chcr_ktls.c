@@ -20,6 +20,9 @@ static int chcr_short_record_handler(struct chcr_ktls_info *tx_info,
                                      u32 data_len, u32 skb_offset,
                                      struct sge_eth_txq *q, u32 tls_end_offset,
                                      unsigned int chip_ver);
+static int chcr_ktls_sw_fallback(struct sk_buff *skb,
+                                 struct chcr_ktls_info *tx_info,
+                                 struct sge_eth_txq *q, bool plaintxt);
 
 #define SIZE_ACK_ENC_CPL 32 /* cpl_fw6_pld */
 
@@ -2806,11 +2809,16 @@ static int chcr_short_record_handler(struct chcr_ktls_info *tx_info,
 
 	/* check if it is only the header part. */
 	if (tls_rec_offset + data_len <= (TLS_HEADER_SIZE + tx_info->iv_size)) {
-		if (chcr_ktls_tx_plaintxt(tx_info, skb, tcp_seq, mss,
-					  tcp_push_no_fin, q,
-					  tx_info->port_id, prior_data,
-					  data_len, skb_offset, prior_data_len))
-			goto out;
+		if (chip_ver == CHELSIO_T5) {
+			if (chcr_ktls_sw_fallback(skb, tx_info, q, 1))
+				goto out;
+		} else {
+			if (chcr_ktls_tx_plaintxt(tx_info, skb, tcp_seq, mss,
+						  tcp_push_no_fin, q,
+						  tx_info->port_id, prior_data,
+						  data_len, skb_offset, prior_data_len))
+				goto out;
+		}
 
 		tx_info->prev_seq = tcp_seq + data_len;
 		return 0;
@@ -2910,13 +2918,16 @@ out:
 
 static int chcr_ktls_sw_fallback(struct sk_buff *skb,
 				 struct chcr_ktls_info *tx_info,
-				 struct sge_eth_txq *q)
+				 struct sge_eth_txq *q, bool plaintxt)
 {
 	u32 data_len, skb_offset;
 	struct sk_buff *nskb;
 	struct tcphdr *th;
 
-	nskb = tls_encrypt_skb(skb);
+	if (plaintxt)
+		nskb = skb;
+	else
+		nskb = tls_encrypt_skb(skb);
 
 	if (!nskb)
 		return 0;
@@ -3051,11 +3062,14 @@ static int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
 			else
 				tls_end_offset = data_len;
 
-			ret = chcr_ktls_tx_plaintxt(tx_info, skb, tcp_seq, mss,
-						    (!th->fin && th->psh), q,
-						    tx_info->port_id, NULL,
-						    tls_end_offset, skb_offset,
-						    0);
+			if (chip_ver == CHELSIO_T5) 
+				ret = chcr_ktls_sw_fallback(skb, tx_info, q, 1);
+			else
+				ret = chcr_ktls_tx_plaintxt(tx_info, skb, tcp_seq, mss,
+							    (!th->fin && th->psh), q,
+							    tx_info->port_id, NULL,
+							    tls_end_offset, skb_offset,
+							    0);
 
 			spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
 			if (ret) {
@@ -3083,7 +3097,7 @@ static int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
 		/* If a local drop */
 		resync_pending = tls_offload_tx_resync_pending(skb->sk);
 		if (resync_pending || tx_info->prev_seq < tcp_seq) {
-			ret = chcr_ktls_sw_fallback(skb, tx_info, q);
+			ret = chcr_ktls_sw_fallback(skb, tx_info, q, 0);
 			if (!resync_pending && tx_info->prev_seq < tcp_seq)
 				tls_offload_tx_resync_request(skb->sk, tcp_seq,
 			                                      tx_info->prev_seq);
@@ -3127,7 +3141,7 @@ static int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
 				dev_kfree_skb_any(skb);
 
 			if (ret == FALLBACK)
-				return chcr_ktls_sw_fallback(skb, tx_info, q);
+				return chcr_ktls_sw_fallback(skb, tx_info, q, 0);
 
 			return NETDEV_TX_OK;
 		}
