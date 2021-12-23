@@ -379,6 +379,32 @@ static int chcr_ktls_mark_tcb_close(struct chcr_ktls_info *tx_info)
 				  CHCR_TCB_STATE_CLOSED, 1);
 }
 
+static int chcr_ktls_net_tls_resync(struct net_device *netdev, struct sock *sk,
+				    u32 seq, u8 *rcd_sn,
+				    enum tls_offload_ctx_dir direction)
+{
+	struct chcr_ktls_ofld_ctx_tx *tx_ctx;
+	struct tls_context *tls_ctx;
+	struct chcr_ktls_info *tx_info;
+	if (direction == TLS_OFFLOAD_CTX_DIR_RX) {
+		return -EINVAL;
+	}
+
+	tls_ctx = tls_get_ctx(sk);
+	if (unlikely(tls_ctx->netdev != netdev))
+                return -EINVAL;
+	tx_ctx = chcr_get_ktls_tx_context(tls_ctx);
+	tx_info = tx_ctx->chcr_info;
+
+	if (unlikely(!tx_info))
+		return -EINVAL;
+
+	memcpy(&tx_info->record_no, rcd_sn, sizeof(tx_info->record_no));
+	tx_info->prev_seq = seq;
+
+	return 0;
+}
+
 /*
  * chcr_ktls_dev_del:  call back for tls_dev_del.
  * Remove the tid and l2t entry and close the connection.
@@ -1653,10 +1679,12 @@ static int chcr_ktls_xmit_wr_complete(struct sk_buff *skb,
 				      struct sge_eth_txq *q, u32 tcp_seq,
 				      bool is_last_wr, u32 data_len,
 				      u32 skb_offset, u32 nfrags,
-				      bool tcp_push, u32 mss)
+				      bool tcp_push, u32 mss,
+				      unsigned int chip_ver, u32 tls_end_offset)
 {
 	u32 len16, wr_mid = 0, flits = 0, ndesc, cipher_start;
 	struct adapter *adap = tx_info->adap;
+	struct cpl_rx_phys_dsgl *phys_cpl;
 	int credits, left, last_desc;
 	struct tx_sw_desc *sgl_sdesc;
 	struct cpl_tx_data *tx_data;
@@ -1724,7 +1752,7 @@ static int chcr_ktls_xmit_wr_complete(struct sk_buff *skb,
 	 * cpl_tx_data header.
 	 */
 	idata->len = htonl(sizeof(*cpl) + tx_info->key_ctx_len +
-			   sizeof(*tx_data));
+			   (chip_ver == CHELSIO_T7 ? 0 : sizeof(*tx_data)));
 	/* SEC CPL */
 	cpl = (struct cpl_tx_sec_pdu *)(idata + 1);
 	cpl->op_ivinsrtofst =
@@ -1734,13 +1762,21 @@ static int chcr_ktls_xmit_wr_complete(struct sk_buff *skb,
 		      CPL_TX_SEC_PDU_IVINSRTOFST_V(TLS_HEADER_SIZE + 1));
 	cpl->pldlen = htonl(data_len);
 
-	/* encryption should start after tls header size + iv size */
-	cipher_start = TLS_HEADER_SIZE + tx_info->iv_size + 1;
+	if (chip_ver == CHELSIO_T7) {
+		cipher_start = skb_offset + TLS_HEADER_SIZE + tx_info->iv_size + 1;
+		cpl->aadstart_cipherstop_hi =
+			htonl(CPL_TX_SEC_PDU_AADSTART_V(skb_offset + 1) |
+			     CPL_TX_SEC_PDU_AADSTOP_V(skb_offset + TLS_HEADER_SIZE) |
+                             CPL_TX_SEC_PDU_CIPHERSTART_V(cipher_start));
+	} else {
+		/* encryption should start after tls header size + iv size */
+		cipher_start = TLS_HEADER_SIZE + tx_info->iv_size + 1;
 
-	cpl->aadstart_cipherstop_hi =
-		htonl(CPL_TX_SEC_PDU_AADSTART_V(1) |
-		      CPL_TX_SEC_PDU_AADSTOP_V(TLS_HEADER_SIZE) |
-		      CPL_TX_SEC_PDU_CIPHERSTART_V(cipher_start));
+		cpl->aadstart_cipherstop_hi =
+			htonl(CPL_TX_SEC_PDU_AADSTART_V(1) |
+			      CPL_TX_SEC_PDU_AADSTOP_V(TLS_HEADER_SIZE) |
+			      CPL_TX_SEC_PDU_CIPHERSTART_V(cipher_start));
+	}
 
 	/* authentication will also start after tls header + iv size */
 	cpl->cipherstop_lo_authinsert =
@@ -1771,6 +1807,9 @@ static int chcr_ktls_xmit_wr_complete(struct sk_buff *skb,
 		pos = q->q.desc;
 		end = pos + left;
 	}
+
+	if (chip_ver == CHELSIO_T7)
+		goto skip_cpl_tx_data;
 	/* CPL_TX_DATA */
 	tx_data = (void *)pos;
 	OPCODE_TID(tx_data) = htonl(MK_OPCODE_TID(CPL_TX_DATA, tx_info->tid));
@@ -1793,9 +1832,28 @@ static int chcr_ktls_xmit_wr_complete(struct sk_buff *skb,
 		end = pos + left;
 	}
 
-	/* send the complete packet except the header */
-	cxgb4_write_partial_sgl(skb, &q->q, pos, end, sgl_sdesc->addr,
-				skb_offset, data_len);
+skip_cpl_tx_data:
+
+	/* cpl_rx_phys_dsgl
+	 * This is a full record but we are only forwarding tls_end_offset size
+	 * Rest we are dropping
+	 */
+	if (chip_ver == CHELSIO_T7) {
+		phys_cpl = (void*)pos;
+		pos += sizeof(*phys_cpl);
+		phys_cpl->op_PhysAddrFields_hi = 0;
+		phys_cpl->PhysAddrFields_lo_to_NumSGE = htonl(CPL_RX_PHYS_DSGL_SPLITMODE_F |
+				 			      CPL_RX_PHYS_DSGL_NUMSGE_V(1));
+
+		phys_cpl->RSSCopy[0] = htonl(tls_end_offset | 0<<16);
+		phys_cpl->RSSCopy[1] = htonl(0<<16 | (skb->len - tls_end_offset));
+
+                cxgb4_write_sgl(skb, &q->q, pos, end, 0, sgl_sdesc->addr);
+	} else {
+		/* send the complete packet except the header */
+		cxgb4_write_partial_sgl(skb, &q->q, pos, end, sgl_sdesc->addr,
+					skb_offset, data_len);
+	}
 	sgl_sdesc->skb = skb;
 
 	chcr_txq_advance(&q->q, ndesc);
@@ -2138,7 +2196,7 @@ static int chcr_ktls_xmit_wr_short(struct sk_buff *skb,
 				   u32 tcp_seq, bool tcp_push, u32 mss,
 				   u32 tls_rec_offset, u8 *prior_data,
 				   u32 prior_data_len, u32 data_len,
-				   u32 skb_offset)
+				   u32 skb_offset, unsigned int chip_ver)
 {
 	u32 len16, wr_mid = 0, cipher_start, nfrags;
 	struct adapter *adap = tx_info->adap;
@@ -2159,6 +2217,8 @@ static int chcr_ktls_xmit_wr_short(struct sk_buff *skb,
 	 * (AES_BLOCK_SIZE) will be added.
 	 */
 	flits = chcr_ktls_get_tx_flits(nfrags, tx_info->key_ctx_len) + 2;
+	if (chip_ver == CHELSIO_T7)
+		flits -= 2; /* skipped cpl_tx_data */
 	/* get the correct 8 byte IV of this record */
 	iv_record = cpu_to_be64(tx_info->iv + tx_info->record_no);
 	/* If it's a middle record and not 16 byte aligned to run AES CTR, need
@@ -2216,21 +2276,29 @@ static int chcr_ktls_xmit_wr_short(struct sk_buff *skb,
 	 * cpl_tx_data header.
 	 */
 	idata->len = htonl(sizeof(*cpl) + tx_info->key_ctx_len +
-			   sizeof(*tx_data) + AES_BLOCK_LEN + prior_data_len);
+			   chip_ver == CHELSIO_T7 ? 0 : sizeof(*tx_data)
+			   + AES_BLOCK_LEN + prior_data_len);
 	/* SEC CPL */
 	cpl = (struct cpl_tx_sec_pdu *)(idata + 1);
 	/* cipher start will have tls header + iv size extra if its a header
 	 * part of tls record. else only 16 byte IV will be added.
 	 */
-	cipher_start =
-		AES_BLOCK_LEN + 1 +
-		(!tls_rec_offset ? TLS_HEADER_SIZE + tx_info->iv_size : 0);
+	if (chip_ver == CHELSIO_T7) {
+		cipher_start =
+			skb_offset + AES_BLOCK_LEN + 1 +
+			(!tls_rec_offset ? TLS_HEADER_SIZE + tx_info->iv_size : 0);
+		cpl->pldlen = htonl(skb_offset + data_len + AES_BLOCK_LEN + prior_data_len);
+	} else {
+		cipher_start =
+			AES_BLOCK_LEN + 1 +
+			(!tls_rec_offset ? TLS_HEADER_SIZE + tx_info->iv_size : 0);
+		cpl->pldlen = htonl(data_len + AES_BLOCK_LEN + prior_data_len);
+	}
 
 	cpl->op_ivinsrtofst =
 		htonl(CPL_TX_SEC_PDU_OPCODE_V(CPL_TX_SEC_PDU) |
 		      CPL_TX_SEC_PDU_CPLLEN_V(CHCR_CPL_TX_SEC_PDU_LEN_64BIT) |
 		      CPL_TX_SEC_PDU_IVINSRTOFST_V(1));
-	cpl->pldlen = htonl(data_len + AES_BLOCK_LEN + prior_data_len);
 	cpl->aadstart_cipherstop_hi =
 		htonl(CPL_TX_SEC_PDU_CIPHERSTART_V(cipher_start));
 	cpl->cipherstop_lo_authinsert = 0;
@@ -2257,6 +2325,10 @@ static int chcr_ktls_xmit_wr_short(struct sk_buff *skb,
 		pos = q->q.desc;
 		end = pos + left;
 	}
+
+	if (chip_ver == CHELSIO_T7)
+		goto skip_cpl_tx_data;
+
 	/* CPL_TX_DATA */
 	tx_data = (void *)pos;
 	OPCODE_TID(tx_data) = htonl(MK_OPCODE_TID(CPL_TX_DATA, tx_info->tid));
@@ -2277,6 +2349,8 @@ static int chcr_ktls_xmit_wr_short(struct sk_buff *skb,
 		pos = q->q.desc;
 		end = pos + left;
 	}
+
+skip_cpl_tx_data:
 	/* copy the 16 byte IV for AES-CTR, which includes 4 bytes of salt, 8
 	 * bytes of actual IV and 4 bytes of 16 byte-sequence.
 	 */
@@ -2293,9 +2367,13 @@ static int chcr_ktls_xmit_wr_short(struct sk_buff *skb,
 	 */
 	if (prior_data_len)
 		pos = chcr_copy_to_txd(prior_data, &q->q, pos, 16);
-	/* send the complete packet except the header */
-	cxgb4_write_partial_sgl(skb, &q->q, pos, end, sgl_sdesc->addr,
-				skb_offset, data_len);
+
+	if (chip_ver == CHELSIO_T7)
+		cxgb4_write_sgl(skb, &q->q, pos, end, 0, sgl_sdesc->addr);
+	else
+		/* send the complete packet except the header */
+		cxgb4_write_partial_sgl(skb, &q->q, pos, end, sgl_sdesc->addr,
+					skb_offset, data_len);
 	sgl_sdesc->skb = skb;
 
 	chcr_txq_advance(&q->q, ndesc);
@@ -2630,7 +2708,7 @@ static int chcr_end_part_handler(struct chcr_ktls_info *tx_info,
 			return NETDEV_TX_BUSY;
 		}
 
-		if (chip_ver == CHELSIO_T7) {
+		if (tcp_seq == tx_info->prev_seq && chip_ver == CHELSIO_T7) {
 			ret = chcr_short_record_handler(tx_info, nskb,
 							record, tcp_seq, mss,
 							tcp_push_no_fin, nskb->len - skb_offset,
@@ -2645,9 +2723,11 @@ static int chcr_end_part_handler(struct chcr_ktls_info *tx_info,
 		/* packet is being sent from the beginning, update the tcp_seq
 		 * accordingly.
 		 */
-		tcp_seq = tls_record_start_seq(record);
-		/* reset skb offset */
-		skb_offset = 0;
+		if (chip_ver == CHELSIO_T6) {
+			tcp_seq = tls_record_start_seq(record);
+			/* reset skb offset */
+			skb_offset = 0;
+		}
 
 		if (last_wr)
 			dev_kfree_skb_any(skb);
@@ -2660,7 +2740,7 @@ static int chcr_end_part_handler(struct chcr_ktls_info *tx_info,
 				       last_wr, record->len, skb_offset,
 				       record->num_frags,
 				       (last_wr && tcp_push_no_fin),
-				       mss)) {
+				       mss, chip_ver, tls_end_offset)) {
 		goto out;
 	}
 	tx_info->prev_seq = record->end_seq;
@@ -2807,7 +2887,7 @@ static int chcr_short_record_handler(struct chcr_ktls_info *tx_info,
 		atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_start_pkts);
 	}
 
-	if (chip_ver == CHELSIO_T7) {
+	if (tcp_seq == tx_info->prev_seq && chip_ver == CHELSIO_T7) {
 		if (chcr_t7_ktls_xmit_wr_short(skb, tx_info, q, record, tcp_seq,
 					       tls_rec_offset, prior_data,
 					       prior_data_len, data_len,
@@ -2816,7 +2896,8 @@ static int chcr_short_record_handler(struct chcr_ktls_info *tx_info,
 	} else {
 		if (chcr_ktls_xmit_wr_short(skb, tx_info, q, tcp_seq, tcp_push_no_fin,
 				    mss, tls_rec_offset, prior_data,
-				    prior_data_len, data_len, skb_offset))
+				    prior_data_len, data_len, skb_offset,
+				    chip_ver))
 			goto out;
 	}
 
@@ -2867,6 +2948,7 @@ static int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct tls_record_info *record;
 	struct chcr_ktls_info *tx_info;
 	struct tls_context *tls_ctx;
+	bool resync_pending = false;
 	struct sge_eth_txq *q;
 	unsigned int chip_ver;
 	struct adapter *adap;
@@ -2998,6 +3080,15 @@ static int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
 		/* lock cleared */
 		spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
 
+		/* If a local drop */
+		resync_pending = tls_offload_tx_resync_pending(skb->sk);
+		if (resync_pending || tx_info->prev_seq < tcp_seq) {
+			ret = chcr_ktls_sw_fallback(skb, tx_info, q);
+			if (!resync_pending && tx_info->prev_seq < tcp_seq)
+				tls_offload_tx_resync_request(skb->sk, tcp_seq,
+			                                      tx_info->prev_seq);
+			goto out;
+		}
 
 		/* if a tls record is finishing in this SKB */
 		if (tls_end_offset <= data_len) {
@@ -3082,6 +3173,7 @@ out:
 static const struct tlsdev_ops chcr_ktls_ops = {
 	.tls_dev_add = chcr_ktls_dev_add,
 	.tls_dev_del = chcr_ktls_dev_del,
+	.tls_dev_resync = chcr_ktls_net_tls_resync,
 };
 
 static chcr_handler_func work_handlers[NUM_CPL_CMDS] = {
